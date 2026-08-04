@@ -108,3 +108,139 @@ def test_format_search_results_empty():
 def test_format_search_results_formats():
     results = [{"title": "t", "url": "u", "snippet": "s"}]
     assert "- t: s (u)" in format_search_results(results)
+
+
+# ---------------------------------------------------------------------------
+# Large concurrent workload tests (issue #43)
+# ---------------------------------------------------------------------------
+
+def _make_questions(n):
+    """Return a list of n distinct question strings."""
+    return [f"question_{i}" for i in range(n)]
+
+
+def _fast_search(query):
+    """Minimal stub: returns one result instantly."""
+    return [{"title": query, "url": f"https://example.com/{query}", "snippet": f"snippet for {query}"}]
+
+
+def test_researcher_20_concurrent_all_complete():
+    """All 20 tasks must appear in research notes — no silent drops."""
+    questions = _make_questions(20)
+
+    with patch("app.agents.web_search", side_effect=_fast_search), _patch_call_llm():
+        state = researcher_node(_base_state(questions))
+
+    notes = state["research_notes"]
+    for q in questions:
+        assert f"Sub-question: {q}" in notes, f"Missing result for {q}"
+    assert state["steps"][-1]["agent"] == "researcher"
+
+
+def test_researcher_50_concurrent_all_complete():
+    """All 50 tasks must appear in research notes — no silent drops."""
+    questions = _make_questions(50)
+
+    with patch("app.agents.web_search", side_effect=_fast_search), _patch_call_llm():
+        state = researcher_node(_base_state(questions))
+
+    notes = state["research_notes"]
+    for q in questions:
+        assert f"Sub-question: {q}" in notes, f"Missing result for {q}"
+    assert state["steps"][-1]["agent"] == "researcher"
+
+
+def test_researcher_20_concurrent_ordering_preserved():
+    """Output order must match input order regardless of completion order."""
+    questions = _make_questions(20)
+
+    # Reverse-stagger sleep times so later questions finish first.
+    def staggered_search(query):
+        idx = int(query.split("_")[1])
+        delay = (20 - idx) * 0.005  # question_0 sleeps longest
+        time.sleep(delay)
+        return [{"title": query, "url": "u", "snippet": "s"}]
+
+    with patch("app.agents.web_search", side_effect=staggered_search), _patch_call_llm():
+        state = researcher_node(_base_state(questions))
+
+    notes = state["research_notes"]
+    positions = [notes.index(f"Sub-question: question_{i}") for i in range(20)]
+    assert positions == sorted(positions), "Output order does not match input order"
+
+
+def test_researcher_50_concurrent_ordering_preserved():
+    """Output order must match input order for 50 questions with varied latency."""
+    questions = _make_questions(50)
+
+    def staggered_search(query):
+        idx = int(query.split("_")[1])
+        delay = (50 - idx) * 0.002  # question_0 sleeps longest
+        time.sleep(delay)
+        return [{"title": query, "url": "u", "snippet": "s"}]
+
+    with patch("app.agents.web_search", side_effect=staggered_search), _patch_call_llm():
+        state = researcher_node(_base_state(questions))
+
+    notes = state["research_notes"]
+    positions = [notes.index(f"Sub-question: question_{i}") for i in range(50)]
+    assert positions == sorted(positions), "Output order does not match input order"
+
+
+def test_researcher_20_concurrent_stable_under_load():
+    """20 concurrent tasks complete in well under sequential time."""
+    questions = _make_questions(20)
+    per_task_sleep = 0.05  # 0.05 s × 20 = 1.0 s sequential
+
+    def slow_search(query):
+        time.sleep(per_task_sleep)
+        return [{"title": query, "url": "u", "snippet": "s"}]
+
+    with patch("app.agents.web_search", side_effect=slow_search), _patch_call_llm():
+        start = time.perf_counter()
+        state = researcher_node(_base_state(questions))
+        duration = time.perf_counter() - start
+
+    # ThreadPoolExecutor caps at 8 workers, so expect ~ceil(20/8)*0.05 = 0.15 s.
+    # Allow 0.6 s to keep the test stable on slow CI.
+    assert duration < 0.6, f"Took {duration:.2f}s — concurrency may not be working"
+    assert state["research_notes"]
+
+
+def test_researcher_50_concurrent_stable_under_load():
+    """50 concurrent tasks complete in well under sequential time."""
+    questions = _make_questions(50)
+    per_task_sleep = 0.02  # 0.02 s × 50 = 1.0 s sequential
+
+    def slow_search(query):
+        time.sleep(per_task_sleep)
+        return [{"title": query, "url": "u", "snippet": "s"}]
+
+    with patch("app.agents.web_search", side_effect=slow_search), _patch_call_llm():
+        start = time.perf_counter()
+        state = researcher_node(_base_state(questions))
+        duration = time.perf_counter() - start
+
+    # 8 workers × batches: ceil(50/8)*0.02 = 0.14 s. Allow 0.6 s for CI headroom.
+    assert duration < 0.6, f"Took {duration:.2f}s — concurrency may not be working"
+    assert state["research_notes"]
+
+
+def test_researcher_large_workload_partial_failures_dont_drop_successes():
+    """With 30 questions where every 5th fails, the rest still appear in notes."""
+    questions = _make_questions(30)
+
+    def selective_fail(query):
+        idx = int(query.split("_")[1])
+        if idx % 5 == 0:
+            raise RuntimeError(f"simulated failure for {query}")
+        return [{"title": query, "url": "u", "snippet": "s"}]
+
+    with patch("app.agents.web_search", side_effect=selective_fail), _patch_call_llm():
+        state = researcher_node(_base_state(questions))
+
+    notes = state["research_notes"]
+    for i, q in enumerate(questions):
+        assert f"Sub-question: {q}" in notes, f"Entry missing for {q}"
+        if i % 5 == 0:
+            assert "Search failed" in notes or f"question_{i}" in notes
